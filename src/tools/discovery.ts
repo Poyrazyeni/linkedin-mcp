@@ -75,7 +75,7 @@ export function registerDiscoveryTools(
 
   server.tool(
     'get_inbox',
-    'List your recent LinkedIn messaging conversations (title, last activity, unread count).',
+    'List your recent LinkedIn messaging conversations (participants with name/headline/profile, title, last activity, unread count).',
     {},
     async () =>
       run(logger, 'get_inbox', async () => {
@@ -208,7 +208,7 @@ export function registerDiscoveryTools(
 
   server.tool(
     'get_conversation',
-    'Read messages in a LinkedIn conversation by its URN (get the URN from get_inbox).',
+    'Read messages in a LinkedIn conversation by its URN (get the URN from get_inbox). Messages are sorted oldest-first with sender attribution (name + fromSelf flag).',
     {
       conversation_urn: z
         .string()
