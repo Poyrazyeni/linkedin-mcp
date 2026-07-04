@@ -398,7 +398,11 @@ export function conversationMessages(
   conversationUrn: string,
   queryId: string = KNOWN_QUERY_IDS.messagingMessages,
 ): string {
-  const urn = encodeURIComponent(conversationUrn);
+  // encodeURIComponent leaves `(` and `)` unescaped, but msg_conversation URNs
+  // contain parentheses: urn:li:msg_conversation:(urn:li:fsd_profile:<id>,<threadId>).
+  // Raw parens break the REST-li `variables=(...)` parser, so this endpoint
+  // returned HTTP 400 for every real conversation URN. Encode them explicitly.
+  const urn = encodeURIComponent(conversationUrn).replace(/\(/g, '%28').replace(/\)/g, '%29');
   return `/voyagerMessagingGraphQL/graphql?queryId=${encodeURIComponent(queryId)}&variables=(conversationUrn:${urn})`;
 }
 

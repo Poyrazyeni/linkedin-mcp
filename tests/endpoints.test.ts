@@ -13,6 +13,8 @@ import {
   companyById,
   messagingConversations,
   messagingConversationEvents,
+  inboxConversations,
+  conversationMessages,
   messagingConversationsGraphql,
   invitationsReceived,
   invitationsSent,
@@ -241,5 +243,33 @@ describe('endpoints — determinism', () => {
     expect(searchClusters('x', 'JOBS', 0, 10)).toBe(
       searchClusters('x', 'JOBS', 0, 10),
     );
+  });
+});
+
+describe('endpoints — messaging GraphQL builders', () => {
+  it('inboxConversations() encodes the mailbox urn', () => {
+    expect(inboxConversations('ACoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')).toBe(
+      `/voyagerMessagingGraphQL/graphql?queryId=${encodeURIComponent(
+        KNOWN_QUERY_IDS.messagingConversations,
+      )}&variables=(mailboxUrn:urn%3Ali%3Afsd_profile%3AACoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)`,
+    );
+  });
+
+  it('conversationMessages() percent-encodes the parentheses inside msg_conversation urns', () => {
+    // msg_conversation URNs contain ( ) and a comma; raw parens break the
+    // REST-li variables=(...) parser server-side (HTTP 400).
+    const urn =
+      'urn:li:msg_conversation:(urn:li:fsd_profile:ACoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,2-THREADID==)';
+    const path = conversationMessages(urn);
+    const variables = path.split('&variables=')[1];
+    expect(variables.startsWith('(conversationUrn:')).toBe(true);
+    const encodedUrn = variables.slice('(conversationUrn:'.length, -1);
+    // No raw parens may survive inside the urn value…
+    expect(encodedUrn).not.toContain('(');
+    expect(encodedUrn).not.toContain(')');
+    expect(encodedUrn).toContain('%28');
+    expect(encodedUrn).toContain('%29');
+    // …and decoding restores the original urn exactly.
+    expect(decodeURIComponent(encodedUrn)).toBe(urn);
   });
 });
