@@ -124,26 +124,111 @@ export function ownFsdId(me: NormalizedResponse): string | undefined {
   return undefined;
 }
 
+export interface ShapedParticipant {
+  name?: string;
+  headline?: string;
+  /** urn:li:fsd_profile:<id> */
+  profileUrn?: string;
+  profileUrl?: string;
+}
+
 export interface ShapedConversation {
   title?: string;
+  /** The other member(s) in the thread — the mailbox owner is excluded. */
+  participants?: ShapedParticipant[];
+  groupChat?: boolean;
   lastActivityAt?: number;
   unreadCount?: number;
   read?: boolean;
   conversationUrn?: string;
 }
 
-/** Shape an inbox conversations response into a compact list. */
+/**
+ * Index the `com.linkedin.messenger.MessagingParticipant` entities of a
+ * messaging response by entityUrn
+ * (urn:li:msg_messagingParticipant:urn:li:fsd_profile:<id>).
+ */
+function indexMessagingParticipants(resp: NormalizedResponse): Map<string, VoyagerEntity> {
+  const map = new Map<string, VoyagerEntity>();
+  for (const e of resp.included ?? []) {
+    if (
+      typeof e.$type === 'string' &&
+      e.$type.endsWith('.MessagingParticipant') &&
+      typeof e.entityUrn === 'string'
+    ) {
+      map.set(e.entityUrn, e);
+    }
+  }
+  return map;
+}
+
+/** Shape a MessagingParticipant entity into a compact identity. */
+function shapeMessagingParticipant(p?: VoyagerEntity): ShapedParticipant | undefined {
+  if (!p) return undefined;
+  const member = (p['participantType'] as Record<string, unknown> | undefined)?.['member'] as
+    | Record<string, unknown>
+    | undefined;
+  const name =
+    [asText(member?.['firstName']), asText(member?.['lastName'])].filter(Boolean).join(' ') ||
+    undefined;
+  return {
+    name,
+    headline: asText(member?.['headline']),
+    profileUrn:
+      typeof p['hostIdentityUrn'] === 'string' ? (p['hostIdentityUrn'] as string) : undefined,
+    profileUrl:
+      typeof member?.['profileUrl'] === 'string' ? (member['profileUrl'] as string) : undefined,
+  };
+}
+
+/**
+ * The mailbox owner's fsd_profile id is embedded in every msg_conversation URN:
+ * urn:li:msg_conversation:(urn:li:fsd_profile:<OWNER>,<threadId>).
+ */
+function ownerIdFromConversationUrn(urn: unknown): string | undefined {
+  return typeof urn === 'string' ? urn.match(/urn:li:fsd_profile:([^,)]+)/)?.[1] : undefined;
+}
+
+/**
+ * Shape an inbox conversations response into a compact list.
+ *
+ * Conversations reference their members via `*conversationParticipants`
+ * (MessagingParticipant URNs); resolving those against `included[]` yields the
+ * counterpart's name/headline/profile — without it, 1:1 threads (whose `title`
+ * is null) are unidentifiable without fetching each conversation.
+ */
 export function shapeInbox(resp: NormalizedResponse): ShapedConversation[] {
   const out: ShapedConversation[] = [];
+  const participants = indexMessagingParticipants(resp);
   for (const e of resp.included ?? []) {
     if (typeof e.$type !== 'string' || !e.$type.endsWith('.Conversation')) continue;
     const c = e as Record<string, unknown>;
+    const conversationUrn =
+      typeof c['entityUrn'] === 'string' ? (c['entityUrn'] as string) : undefined;
+    const ownerId = ownerIdFromConversationUrn(conversationUrn);
+    const partUrns = Array.isArray(c['*conversationParticipants'])
+      ? (c['*conversationParticipants'] as unknown[])
+      : [];
+    const others = partUrns
+      .filter((u): u is string => typeof u === 'string' && (!ownerId || !u.includes(ownerId)))
+      .map((u) => shapeMessagingParticipant(participants.get(u)))
+      .filter((p): p is ShapedParticipant => !!p);
     out.push({
-      title: asText(c['title']) ?? asText(c['headlineText']) ?? asText(c['shortHeadlineText']),
-      lastActivityAt: typeof c['lastActivityAt'] === 'number' ? (c['lastActivityAt'] as number) : undefined,
+      title:
+        asText(c['title']) ??
+        asText(c['headlineText']) ??
+        asText(c['shortHeadlineText']) ??
+        (others
+          .map((p) => p.name)
+          .filter(Boolean)
+          .join(', ') || undefined),
+      participants: others.length ? others : undefined,
+      groupChat: typeof c['groupChat'] === 'boolean' ? (c['groupChat'] as boolean) : undefined,
+      lastActivityAt:
+        typeof c['lastActivityAt'] === 'number' ? (c['lastActivityAt'] as number) : undefined,
       unreadCount: typeof c['unreadCount'] === 'number' ? (c['unreadCount'] as number) : undefined,
       read: typeof c['read'] === 'boolean' ? (c['read'] as boolean) : undefined,
-      conversationUrn: typeof c['entityUrn'] === 'string' ? (c['entityUrn'] as string) : undefined,
+      conversationUrn,
     });
   }
   return out;
@@ -198,19 +283,50 @@ export function shapeJobDetails(resp: NormalizedResponse): ShapedJobDetails {
 export interface ShapedMessage {
   text?: string;
   deliveredAt?: number;
+  /** Sender display name, resolved from the response's MessagingParticipant entities. */
+  sender?: string;
+  /** urn:li:fsd_profile:<id> of the sender. */
+  senderProfileUrn?: string;
+  /** True when the mailbox owner (authenticated user) sent the message. */
+  fromSelf?: boolean;
 }
 
-/** Shape a conversation's messages (tolerant; field names may vary by deploy). */
+/**
+ * Shape a conversation's messages (tolerant; field names may vary by deploy).
+ *
+ * Messages carry `*sender` / `*actor` (a MessagingParticipant URN) resolvable
+ * against the same response, and arrive in no guaranteed order — so attribute
+ * each message and sort ascending by deliveredAt. `fromSelf` is derived from
+ * the mailbox-owner id embedded in the message's `*conversation` URN, which
+ * avoids an extra `/me` round-trip.
+ */
 export function shapeConversationMessages(resp: NormalizedResponse): ShapedMessage[] {
   const out: ShapedMessage[] = [];
+  const participants = indexMessagingParticipants(resp);
   for (const e of resp.included ?? []) {
     if (typeof e.$type !== 'string' || !e.$type.endsWith('.Message')) continue;
     const m = e as Record<string, unknown>;
+    const senderUrn =
+      typeof m['*sender'] === 'string'
+        ? (m['*sender'] as string)
+        : typeof m['*actor'] === 'string'
+          ? (m['*actor'] as string)
+          : undefined;
+    const sender = shapeMessagingParticipant(senderUrn ? participants.get(senderUrn) : undefined);
+    const ownerId =
+      ownerIdFromConversationUrn(m['*conversation']) ??
+      ownerIdFromConversationUrn(m['backendConversationUrn']);
+    const fromSelf =
+      ownerId && sender?.profileUrn ? sender.profileUrn.endsWith(ownerId) : undefined;
     out.push({
       text: asText(m['body']) ?? asText(m['previewText']),
       deliveredAt: typeof m['deliveredAt'] === 'number' ? (m['deliveredAt'] as number) : undefined,
+      sender: sender?.name,
+      senderProfileUrn: sender?.profileUrn,
+      ...(typeof fromSelf === 'boolean' ? { fromSelf } : {}),
     });
   }
+  out.sort((a, b) => (a.deliveredAt ?? 0) - (b.deliveredAt ?? 0));
   return out;
 }
 
